@@ -1,0 +1,167 @@
+#include <iostream>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+#include <ctime>
+#include <vector>
+#include <algorithm>
+
+class TrafficSignal {
+public:
+    std::string timestamp;
+    std::string trafficLightId;
+    int carsPassed;
+
+    TrafficSignal(const std::string& timestamp, const std::string& trafficLightId, int carsPassed)
+        : timestamp(timestamp), trafficLightId(trafficLightId), carsPassed(carsPassed) {}
+};
+
+class BoundedBuffer {
+private:
+    std::queue<TrafficSignal> buffer;
+    std::mutex mutex;
+    std::condition_variable notEmpty;
+    const size_t maxSize;
+
+public:
+    BoundedBuffer(size_t maxSize) : maxSize(maxSize) {}
+
+    void put(const TrafficSignal& data) {
+        std::unique_lock<std::mutex> lock(mutex);
+        notEmpty.wait(lock, [this] { return buffer.size() < maxSize; });
+        buffer.push(data);
+        lock.unlock();
+        notEmpty.notify_all();
+    }
+
+    TrafficSignal get() {
+        std::unique_lock<std::mutex> lock(mutex);
+        notEmpty.wait(lock, [this] { return !buffer.empty(); });
+        TrafficSignal data = buffer.front();
+        buffer.pop();
+        lock.unlock();
+        notEmpty.notify_all();
+        return data;
+    }
+};
+
+class TopLocations {
+private:
+    struct LocationData {
+        std::string trafficLightId;
+        int totalCarsPassed;
+
+        bool operator<(const LocationData& other) const {
+            return totalCarsPassed > other.totalCarsPassed;
+        }
+    };
+
+    mutable std::mutex mutex;
+    std::vector<LocationData> locations;
+
+public:
+    void update(const TrafficSignal& signal) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        auto it = std::find_if(locations.begin(), locations.end(),
+            [&signal](const LocationData& location) {
+                return location.trafficLightId == signal.trafficLightId;
+            });
+
+        if (it != locations.end()) {
+            it->totalCarsPassed += signal.carsPassed;
+        } else {
+            locations.push_back({signal.trafficLightId, signal.carsPassed});
+        }
+
+        std::sort(locations.begin(), locations.end());
+    }
+
+    void printTopLocations() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::cout << "Top Locations:\n";
+        for (const auto& location : locations) {
+            std::cout << "TrafficLightID: " << location.trafficLightId << ", Total Cars Passed: " << location.totalCarsPassed << std::endl;
+        }
+        std::cout << "------------------------\n";
+    }
+};
+
+class TrafficProducer {
+private:
+    BoundedBuffer& buffer;
+    std::string trafficLightId;
+
+public:
+    TrafficProducer(BoundedBuffer& buffer, const std::string& trafficLightId)
+        : buffer(buffer), trafficLightId(trafficLightId) {}
+
+    void run() {
+        while (true) {
+            auto now = std::chrono::system_clock::now();
+            std::time_t timestamp = std::chrono::system_clock::to_time_t(now);
+            std::string timestampString = std::ctime(&timestamp);
+            int carsPassed = rand() % 20;
+
+            TrafficSignal signal(timestampString, trafficLightId, carsPassed);
+            buffer.put(signal);
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }
+};
+
+class TrafficConsumer {
+private:
+    BoundedBuffer& buffer;
+    TopLocations& topLocations;
+
+public:
+    TrafficConsumer(BoundedBuffer& buffer, TopLocations& topLocations)
+        : buffer(buffer), topLocations(topLocations) {}
+
+    void run() {
+        while (true) {
+            TrafficSignal data = buffer.get();
+            processSignal(data);
+        }
+    }
+
+    void processSignal(const TrafficSignal& data) {
+        std::cout << "Received data: " << data.timestamp << ", " << data.trafficLightId << ", " << data.carsPassed << std::endl;
+        topLocations.update(data);
+        topLocations.printTopLocations();
+    }
+};
+
+int main() {
+    size_t bufferSize = 10;
+    BoundedBuffer buffer(bufferSize);
+    TopLocations topLocations;
+
+    // Start traffic producers
+    std::vector<std::thread> producers;
+    for (int i = 1; i <= 5; ++i) {
+        std::string trafficLightId = "TrafficLight" + std::to_string(i);
+        producers.emplace_back(std::thread(&TrafficProducer::run, TrafficProducer(buffer, trafficLightId)));
+    }
+
+    // Start traffic consumers
+    std::vector<std::thread> consumers;
+    for (int i = 0; i < 2; ++i) {
+        consumers.emplace_back(std::thread(&TrafficConsumer::run, TrafficConsumer(buffer, topLocations)));
+    }
+
+    // Wait for all producer threads to finish
+    for (auto& producer : producers) {
+        producer.join();
+    }
+
+    // Wait for all consumer threads to finish
+    for (auto& consumer : consumers) {
+        consumer.join();
+    }
+
+    return 0;
+}
